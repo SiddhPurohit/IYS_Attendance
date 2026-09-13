@@ -64,6 +64,10 @@ class _SessionsListScreenState extends ConsumerState<SessionsListScreen> {
     // Only worth a filter row when there is actually something to filter
     // between.
     final showLocationFilter = accessible.length > 1;
+    // With several locations in play the list can hold two rows for the same
+    // day — the same event marked at each location, or two regular sessions
+    // marked together — so each row has to name its location.
+    final showLocationName = accessible.length > 1;
 
     return Scaffold(
       appBar: AppBar(
@@ -144,88 +148,54 @@ class _SessionsListScreenState extends ConsumerState<SessionsListScreen> {
                             color: AppColors.saffronDark,
                           ),
                         ),
-                        title: Row(
-                          children: [
-                            Flexible(
-                              child: Text(
-                                isEvent
-                                    ? eventTitle
-                                    : DateFormat('EEEE, d MMM yyyy')
-                                        .format(date),
-                                style: TextStyle(
-                                  fontWeight:
-                                      isEvent ? FontWeight.w700 : FontWeight.w600,
-                                ),
-                              ),
-                            ),
-                            if (isEvent) ...[
-                              const SizedBox(width: 8),
-                              Container(
-                                padding: const EdgeInsets.symmetric(
-                                    horizontal: 8, vertical: 2),
-                                decoration: BoxDecoration(
-                                  color: AppColors.saffronDark,
-                                  borderRadius: BorderRadius.circular(10),
-                                ),
-                                child: const Text(
-                                  'EVENT',
-                                  style: TextStyle(
-                                    color: Colors.white,
-                                    fontSize: 10,
-                                    fontWeight: FontWeight.w700,
-                                    letterSpacing: 0.5,
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ],
-                        ),
-                        subtitle: Text(
+                        // The EVENT badge lives on the subtitle line rather
+                        // than here, so a long event name always gets the
+                        // full width instead of breaking mid-word.
+                        title: Text(
                           isEvent
-                              ? [
-                                  DateFormat('d MMM yyyy').format(date),
-                                  if (isSuperAdmin) locationName,
-                                ].join(' • ')
-                              : isSuperAdmin
-                                  ? [
-                                      locationName,
-                                      if (notes != null && notes.isNotEmpty)
-                                        notes,
-                                    ].join(' • ')
-                                  : (notes != null && notes.isNotEmpty
-                                      ? notes
-                                      : '$total marked'),
+                              ? eventTitle
+                              // Abbreviated weekday: the full name pushed the
+                              // title onto a second line on narrower phones.
+                              : DateFormat('EEE, d MMM yyyy').format(date),
+                          style: TextStyle(
+                            fontWeight:
+                                isEvent ? FontWeight.w700 : FontWeight.w600,
+                          ),
                         ),
-                        trailing: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 10,
-                                vertical: 5,
-                              ),
-                              decoration: BoxDecoration(
-                                color: isUnmarked
-                                    ? AppColors.saffronDark
-                                    : AppColors.presentGreen
-                                        .withValues(alpha: 0.12),
-                                borderRadius: BorderRadius.circular(16),
-                              ),
-                              child: Text(
-                                isUnmarked ? 'Mark now' : '$present/$total',
-                                style: TextStyle(
-                                  color: isUnmarked
-                                      ? Colors.white
-                                      : AppColors.presentGreen,
-                                  fontWeight: FontWeight.w700,
-                                  fontSize: 13,
-                                ),
-                              ),
+                        isThreeLine: showLocationName,
+                        subtitle: _SessionSubtitle(
+                          isEvent: isEvent,
+                          locationName: showLocationName ? locationName : null,
+                          detail: isEvent
+                              ? DateFormat('d MMM yyyy').format(date)
+                              : (notes != null && notes.isNotEmpty
+                                  ? notes
+                                  : '$total marked'),
+                        ),
+                        // No chevron: the whole row is tappable anyway, and
+                        // those 28px are worth more to the title.
+                        trailing: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 10,
+                            vertical: 5,
+                          ),
+                          decoration: BoxDecoration(
+                            color: isUnmarked
+                                ? AppColors.saffronDark
+                                : AppColors.presentGreen
+                                    .withValues(alpha: 0.12),
+                            borderRadius: BorderRadius.circular(16),
+                          ),
+                          child: Text(
+                            isUnmarked ? 'Mark now' : '$present/$total',
+                            style: TextStyle(
+                              color: isUnmarked
+                                  ? Colors.white
+                                  : AppColors.presentGreen,
+                              fontWeight: FontWeight.w700,
+                              fontSize: 13,
                             ),
-                            const SizedBox(width: 8),
-                            const Icon(Icons.chevron_right,
-                                color: Colors.grey, size: 20),
-                          ],
+                          ),
                         ),
                         onTap: () {
                           final base = isSuperAdmin ? '/dashboard' : '/admin';
@@ -286,6 +256,100 @@ class _SessionsListScreenState extends ConsumerState<SessionsListScreen> {
             );
           }),
         ],
+      ),
+    );
+  }
+}
+
+/// Subtitle for a session row. When the admin holds more than one location
+/// the location is named with a pin — without it, the same event marked at
+/// two locations (or two sessions marked on the same date) are
+/// indistinguishable in the list except by who is inside them.
+class _SessionSubtitle extends StatelessWidget {
+  final bool isEvent;
+  final String? locationName;
+  final String detail;
+
+  const _SessionSubtitle({
+    required this.isEvent,
+    required this.locationName,
+    required this.detail,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final detailStyle = Theme.of(context).textTheme.bodySmall?.copyWith(
+          color: AppColors.onSurfaceVariant,
+        );
+
+    const badge = Padding(
+      padding: EdgeInsets.only(right: 6),
+      child: _EventBadge(),
+    );
+
+    // Nothing to disambiguate — keep it to a single line so rows stay short.
+    if (locationName == null) {
+      return Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (isEvent) badge,
+          Flexible(
+            child: Text(detail, style: detailStyle, overflow: TextOverflow.ellipsis),
+          ),
+        ],
+      );
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        const SizedBox(height: 3),
+        Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (isEvent) badge,
+            const Icon(Icons.location_on,
+                size: 13, color: AppColors.saffronDark),
+            const SizedBox(width: 3),
+            Flexible(
+              child: Text(
+                locationName!,
+                overflow: TextOverflow.ellipsis,
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                      color: AppColors.saffronDark,
+                      fontWeight: FontWeight.w700,
+                    ),
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 2),
+        Text(detail, style: detailStyle),
+      ],
+    );
+  }
+}
+
+class _EventBadge extends StatelessWidget {
+  const _EventBadge();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+      decoration: BoxDecoration(
+        color: AppColors.saffronDark,
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: const Text(
+        'EVENT',
+        style: TextStyle(
+          color: Colors.white,
+          fontSize: 9.5,
+          fontWeight: FontWeight.w700,
+          letterSpacing: 0.5,
+        ),
       ),
     );
   }

@@ -169,6 +169,11 @@ class _MarkAttendanceScreenState extends ConsumerState<MarkAttendanceScreen> {
 
     final showPicker = knownSessionId == null && pickerOptions.length > 1;
     final locationNames = {for (final l in pickerOptions) l.id: l.name};
+    // In the fixed-session flow there is no picker to make the location
+    // obvious, so anyone who holds several locations needs it spelled out —
+    // otherwise an event marked at two locations looks identical either way.
+    final holdsSeveralLocations =
+        (ref.watch(accessibleLocationsProvider).value?.length ?? 0) > 1;
 
     return Scaffold(
       appBar: AppBar(
@@ -179,7 +184,7 @@ class _MarkAttendanceScreenState extends ConsumerState<MarkAttendanceScreen> {
         title: Text(eventTitle ?? 'Mark Attendance'),
         // With a picker on screen the location is already obvious; this
         // subtitle only earns its place when the location is fixed.
-        bottom: (knownSessionId != null && isSuperAdmin)
+        bottom: (knownSessionId != null && holdsSeveralLocations)
             ? PreferredSize(
                 preferredSize: const Size.fromHeight(30),
                 child: _LocationSubtitle(locationId: locationIds.first),
