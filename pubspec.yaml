@@ -1,0 +1,62 @@
+name: iys_attendance
+description: "ISKCON Youth Services — Weekly attendance tracking for youth programs."
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.9.2
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # Supabase backend
+  supabase_flutter: any
+
+  # State management
+  flutter_riverpod: any
+
+  # Routing
+  go_router: any
+
+  # Charts (super admin dashboard)
+  fl_chart: any
+
+  # Date formatting
+  intl: any
+
+  # Typography
+  google_fonts: any
+
+  cupertino_icons: ^1.0.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+  flutter_launcher_icons: ^0.14.4
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/icon/
+
+# Launcher icon — regenerate the source art with:
+#   python3 tool/generate_icon.py
+# then apply it to every platform with:
+#   dart run flutter_launcher_icons
+flutter_launcher_icons:
+  image_path: "assets/icon/app_icon.png"
+  android: "launcher_icon"
+  adaptive_icon_background: "#E8820E"
+  adaptive_icon_foreground: "assets/icon/app_icon_foreground.png"
+  ios: true
+  remove_alpha_ios: true
+  web:
+    generate: true
+    image_path: "assets/icon/app_icon.png"
+    background_color: "#E8820E"
+    theme_color: "#E8A317"
+  macos:
+    generate: true
+    image_path: "assets/icon/app_icon.png"
