@@ -13,14 +13,16 @@ the bottom to refresh this).
 Weekly attendance tracking for ISKCON Youth Services (IYS) programs across
 four physical locations (Vasai, Borivali, Mira Road, Malad). Two roles:
 
-- **Location admin** — scoped to one location. Marks weekly attendance for
-  their own boys (devotees), manages their location's roster, views their
-  location's session history.
-- **Super admin** — no location of their own (`location_id` is `NULL`).
-  Sees every location: a cross-location dashboard with attendance trends,
-  can mark or edit attendance anywhere, can create **special events**
-  (e.g. Janmashtami) that every location marks independently, and gets a
-  bird's-eye view of event attendance broken down by location.
+- **Location admin** — scoped to one *or more* locations, granted through
+  the `admin_locations` table. Marks weekly attendance for their devotees,
+  manages their roster, views their session history. An admin holding
+  several locations can mark them together in one pass (see
+  [Multi-location admins](#multi-location-admins)).
+- **Super admin** — implicitly holds every location, with no grants needed.
+  Gets a cross-location dashboard with attendance trends, can mark or edit
+  attendance anywhere, can create **special events** (e.g. Janmashtami) that
+  every location marks independently, and gets a bird's-eye view of event
+  attendance broken down by location.
 
 There is no public sign-up and no in-app account creation — see
 [Account provisioning](#account-provisioning).
@@ -80,8 +82,8 @@ service layer between screens and Supabase — providers call
 
 ## Database schema
 
-Six tables in `public`, all owned by the app. `auth.users` (managed by
-Supabase Auth) is the seventh, implicit table — `profiles.id` is a 1:1
+Seven tables in `public`, all owned by the app. `auth.users` (managed by
+Supabase Auth) is the eighth, implicit table — `profiles.id` is a 1:1
 mirror of it.
 
 ### `locations`
@@ -107,15 +109,37 @@ explicit FK in `public` since `auth` is a separate schema).
 | id           | uuid          | no       |                      |
 | full_name    | text          | no       |                      |
 | role         | `user_role`   | no       | `'admin'`            |
-| location_id  | uuid → locations.id | yes | (null = super admin) |
+| location_id  | uuid → locations.id | yes | **legacy, unused**   |
 | created_at   | timestamptz   | no       | `now()`              |
 
 `user_role` is a Postgres enum: `'admin' | 'super_admin'`.
 
-No `INSERT`, `UPDATE`, or `DELETE` policy exists on this table (see RLS
+`location_id` is **dead** as of the multi-location migration — no policy and
+no client code reads it, and editing it has no effect on what an admin can
+see. `admin_locations` is the only thing that grants access. It is kept only
+so the migration stays reversible and can be dropped once you're confident.
+
+No `INSERT`, `UPDATE`, or `DELETE` policy exists on `profiles` (see RLS
 below) — profile rows can only be written via the SQL editor / service
 role, never through the app. This is intentional; see
 [Account provisioning](#account-provisioning).
+
+### `admin_locations`
+
+Which locations each admin may act on. An admin with three rows here is an
+admin of three locations.
+
+| column       | type          | nullable | default              |
+|--------------|---------------|----------|----------------------|
+| profile_id   | uuid → profiles.id, **ON DELETE CASCADE** | no | |
+| location_id  | uuid → locations.id, **ON DELETE CASCADE** | no | |
+| created_at   | timestamptz   | no       | `now()`              |
+
+Primary key is `(profile_id, location_id)`. Super admins need no rows —
+their policies short-circuit on role before ever consulting this table.
+Grants are handed out in the SQL editor; see
+[`supabase/multi_location_admins.sql`](supabase/multi_location_admins.sql)
+for ready-made grant/revoke/audit snippets.
 
 ### `members`
 
@@ -211,8 +235,7 @@ location gets it in their session list on creation. See
 
 ## Row-Level Security
 
-RLS is enabled on all six tables (confirmed via `pg_tables.rowsecurity`).
-Two helper functions back almost every policy:
+RLS is enabled on all tables. Two helper functions back almost every policy:
 
 ```sql
 CREATE FUNCTION public.current_role() RETURNS user_role
@@ -220,26 +243,32 @@ CREATE FUNCTION public.current_role() RETURNS user_role
   select role from public.profiles where id = auth.uid();
 $$;
 
-CREATE FUNCTION public.current_location() RETURNS uuid
+CREATE FUNCTION public.accessible_locations() RETURNS setof uuid
   LANGUAGE sql STABLE SECURITY DEFINER AS $$
-  select location_id from public.profiles where id = auth.uid();
+  select location_id from public.admin_locations where profile_id = auth.uid();
 $$;
 ```
 
 Both are `SECURITY DEFINER` — they run as the function owner, not the
-caller, which is what lets them read `profiles` inside a policy that's
-*attached to* `profiles` without recursing into RLS. Every scoped policy
-below ultimately trusts these two functions, which means it ultimately
-trusts `profiles.role` and `profiles.location_id` being un-forgeable — see
-[the self-update fix](#security-history) for why that matters.
+caller, which is what lets them read `profiles`/`admin_locations` inside a
+policy attached to those same tables without recursing into RLS. Every
+scoped policy below ultimately trusts these two, which means it ultimately
+trusts `profiles.role` and the `admin_locations` rows being un-forgeable —
+see [the self-update fix](#security-history) for why that matters.
+
+`current_location()` (returning a single uuid from `profiles.location_id`)
+is the pre-multi-location predecessor of `accessible_locations()`. Nothing
+references it any more; it survives only alongside the legacy column.
 
 Current policies, table by table:
 
 | table | policy | command | rule |
 |---|---|---|---|
-| `attendance` | `attendance_scoped` | ALL | `current_role() = 'super_admin'` OR the row's session belongs to `current_location()` |
-| `members` | `members_scoped` | ALL | `current_role() = 'super_admin'` OR `location_id = current_location()` |
-| `sessions` | `sessions_scoped` | ALL | `current_role() = 'super_admin'` OR `location_id = current_location()` |
+| `attendance` | `attendance_scoped` | ALL | `current_role() = 'super_admin'` OR the row's session sits at a location `in (select accessible_locations())` |
+| `members` | `members_scoped` | ALL | `current_role() = 'super_admin'` OR `location_id in (select accessible_locations())` |
+| `sessions` | `sessions_scoped` | ALL | `current_role() = 'super_admin'` OR `location_id in (select accessible_locations())` |
+| `admin_locations` | `admin_locations_read_own` | SELECT | `profile_id = auth.uid()` OR `current_role() = 'super_admin'` |
+| `admin_locations` | `admin_locations_superadmin_write` | ALL | `current_role() = 'super_admin'` |
 | `events` | `events_read` | SELECT | `auth.role() = 'authenticated'` (any signed-in user) |
 | `events` | `events_superadmin_write` | ALL | `current_role() = 'super_admin'` |
 | `locations` | `locations_read` | SELECT | `auth.role() = 'authenticated'` (no write policy at all) |
@@ -383,6 +412,46 @@ Consequences of this choice:
   sessions (`where event_id is null`) so a one-off festival never moves the
   weekly attendance trend; events get their own separate reporting instead.
 
+### Multi-location admins
+
+An admin's locations live in `admin_locations`, not on their profile. In the
+client, `accessibleLocationsProvider` is the single source of truth for
+scope — it returns every location for a super admin and the granted ones for
+everyone else. `Profile` deliberately has **no** location field, so the
+compiler catches any code still trying to scope by a single location.
+
+**Sessions remain single-location.** When an admin selects Borivali and
+Malad together, Mark Attendance shows one merged roster, and on save
+`saveAttendanceAcrossLocations()` groups the devotees by their *own*
+`member.locationId` and writes each group to that location's session,
+creating those sessions on demand. So marking two locations at once yields
+two session rows, not one shared one.
+
+This was a deliberate fork. Modelling a session as genuinely spanning
+locations (a `session_locations` join table) would have meant rewriting all
+three summary views, both partial unique indexes on `sessions`, the
+`attendance_scoped` policy (a shared session's rows would have to be
+filtered by each devotee's location, or a Borivali admin could read Malad's
+attendance), and the events code path. Fanning out instead keeps
+`attendance_summary_by_location`, the dashboard trend and the location bar
+chart exact and untouched — and it mirrors what the events feature already
+does.
+
+Two consequences worth knowing:
+
+- A location the admin selected that has no eligible devotees gets no
+  session, consistent with sessions only existing once something is marked.
+- Attendance routing follows `member.locationId`, never the selected set, so
+  a devotee can't be written onto another location's session even if the
+  selection changes mid-edit.
+
+Screens adapt to how many locations the admin holds: with one, nothing
+changes (no picker, no location badges, the member form auto-assigns it);
+with several, Mark Attendance grows a chip row, the roster shows a location
+under each name, and the sessions/roster lists gain a location filter. A
+null location filter means "everything I'm allowed to see" — RLS narrows it,
+so no client-side guard is needed.
+
 ### Cache invalidation — the logout leak
 
 Every provider is a plain `FutureProvider` (not `autoDispose`), which means
@@ -451,9 +520,15 @@ settings), new admins are provisioned manually:
 2. In the SQL editor (running as `postgres`, which bypasses RLS — this is
    the only way to write to `profiles` at all), insert the matching row:
    ```sql
-   insert into public.profiles (id, full_name, role, location_id)
-   values ('<auth-user-uuid>', 'Full Name', 'admin', '<location-uuid>');
-   -- role 'super_admin' and location_id null for a super admin
+   insert into public.profiles (id, full_name, role)
+   values ('<auth-user-uuid>', 'Full Name', 'admin');
+   -- use role 'super_admin' for a super admin, who needs no grants below
+   ```
+3. Grant them their location(s) — one row per location:
+   ```sql
+   insert into public.admin_locations (profile_id, location_id)
+   select '<auth-user-uuid>', id from public.locations
+    where name in ('Borivali', 'Malad');
    ```
 
 ## Setup
@@ -464,8 +539,13 @@ flutter run
 ```
 
 Supabase URL/key: [`lib/core/supabase/supabase_client.dart`](lib/core/supabase/supabase_client.dart).
-Schema changes beyond the base tables: [`supabase/schema_updates.sql`](supabase/schema_updates.sql)
-(idempotent — safe to re-run).
+Schema migrations beyond the base tables, in order (both idempotent — safe
+to re-run):
+
+1. [`supabase/schema_updates.sql`](supabase/schema_updates.sql) — joining
+   dates, the events feature, the summary views.
+2. [`supabase/multi_location_admins.sql`](supabase/multi_location_admins.sql)
+   — `admin_locations`, `accessible_locations()`, and the re-scoped policies.
 
 Regenerate the launcher icon after changing `tool/generate_icon.py`:
 
@@ -489,7 +569,8 @@ select json_build_object(
     select json_agg(row_to_json(c) order by c.table_name, c.ordinal_position)
     from information_schema.columns c
     where c.table_schema = 'public'
-      and c.table_name in ('profiles','locations','members','sessions','attendance','events')
+      and c.table_name in ('profiles','locations','members','sessions',
+                           'attendance','events','admin_locations')
   ),
   'policies', (
     select json_agg(row_to_json(p))
@@ -499,7 +580,7 @@ select json_build_object(
   'functions', (
     select json_agg(json_build_object('name', p.proname, 'definition', pg_get_functiondef(p.oid)))
     from pg_proc p
-    where p.proname in ('current_role','current_location')
+    where p.proname in ('current_role','current_location','accessible_locations')
   ),
   'foreign_keys', (
     select json_agg(json_build_object(

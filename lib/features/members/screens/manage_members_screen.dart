@@ -33,22 +33,14 @@ class _ManageMembersScreenState extends ConsumerState<ManageMembersScreen> {
             body: const Center(child: Text('Profile not found.')),
           );
         }
-        final isSuperAdmin = profile.isSuperAdmin;
-        // null means "every location" to the provider, so only a super admin
-        // may pass it.
-        if (!isSuperAdmin &&
-            (profile.locationId == null || profile.locationId!.isEmpty)) {
-          return Scaffold(
-            appBar: AppBar(title: const Text('Manage Devotees')),
-            body: const Center(
-              child: Text('No location assigned to your account.'),
-            ),
-          );
-        }
-        final effectiveLocationId =
-            isSuperAdmin ? _selectedLocationId : profile.locationId;
-
-        return _buildScaffold(context, isSuperAdmin, effectiveLocationId);
+        // A null filter means "everything I'm allowed to see". RLS already
+        // narrows that to this admin's locations, so no client-side location
+        // guard is needed.
+        return _buildScaffold(
+          context,
+          profile.isSuperAdmin,
+          _selectedLocationId,
+        );
       },
       loading: () => Scaffold(
         appBar: AppBar(title: const Text('Manage Devotees')),
@@ -67,9 +59,13 @@ class _ManageMembersScreenState extends ConsumerState<ManageMembersScreen> {
     String? effectiveLocationId,
   ) {
     final membersAsync = ref.watch(membersListProvider(effectiveLocationId));
-    final locationsAsync = ref.watch(allLocationsProvider);
-    final showAll = isSuperAdmin &&
-        (effectiveLocationId == null || effectiveLocationId.isEmpty);
+    final accessible = ref.watch(accessibleLocationsProvider).value ?? const [];
+    // Only worth a filter row when this admin holds more than one location.
+    final showLocationFilter = accessible.length > 1;
+    final showAll = effectiveLocationId == null || effectiveLocationId.isEmpty;
+    // Naming each devotee's location only helps when the list actually
+    // mixes several — for a single-location admin it is just noise.
+    final showLocationLabels = showAll && accessible.length > 1;
 
     return Scaffold(
       appBar: AppBar(
@@ -84,7 +80,9 @@ class _ManageMembersScreenState extends ConsumerState<ManageMembersScreen> {
           final base = isSuperAdmin ? '/dashboard' : '/admin';
           context.push(
             '$base/members/add',
-            extra: (isSuperAdmin && !showAll) ? effectiveLocationId : null,
+            // Pre-selects the location when the list is already filtered to
+            // one, so the form opens on the location being looked at.
+            extra: showAll ? null : effectiveLocationId,
           );
         },
         icon: const Icon(Icons.person_add_outlined),
@@ -92,46 +90,39 @@ class _ManageMembersScreenState extends ConsumerState<ManageMembersScreen> {
       ),
       body: Column(
         children: [
-          if (isSuperAdmin) ...[
+          if (showLocationFilter) ...[
             const SizedBox(height: 12),
-            locationsAsync.when(
-              data: (locations) => SingleChildScrollView(
-                scrollDirection: Axis.horizontal,
-                padding: const EdgeInsets.symmetric(horizontal: 16),
-                child: Row(
-                  children: [
-                    FilterChip(
-                      selected: showAll,
-                      label: const Text('All Locations'),
-                      selectedColor: AppColors.saffron.withValues(alpha: 0.2),
-                      checkmarkColor: AppColors.saffronDark,
-                      onSelected: (_) =>
-                          setState(() => _selectedLocationId = null),
-                    ),
-                    const SizedBox(width: 8),
-                    ...locations.map((loc) {
-                      final isSelected = _selectedLocationId == loc.id;
-                      return Padding(
-                        padding: const EdgeInsets.only(right: 8),
-                        child: FilterChip(
-                          selected: isSelected,
-                          label: Text(loc.name),
-                          selectedColor:
-                              AppColors.saffron.withValues(alpha: 0.2),
-                          checkmarkColor: AppColors.saffronDark,
-                          onSelected: (_) =>
-                              setState(() => _selectedLocationId = loc.id),
-                        ),
-                      );
-                    }),
-                  ],
-                ),
+            SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              child: Row(
+                children: [
+                  FilterChip(
+                    selected: showAll,
+                    label: const Text('All Locations'),
+                    selectedColor: AppColors.saffron.withValues(alpha: 0.2),
+                    checkmarkColor: AppColors.saffronDark,
+                    onSelected: (_) =>
+                        setState(() => _selectedLocationId = null),
+                  ),
+                  const SizedBox(width: 8),
+                  ...accessible.map((loc) {
+                    final isSelected = _selectedLocationId == loc.id;
+                    return Padding(
+                      padding: const EdgeInsets.only(right: 8),
+                      child: FilterChip(
+                        selected: isSelected,
+                        label: Text(loc.name),
+                        selectedColor:
+                            AppColors.saffron.withValues(alpha: 0.2),
+                        checkmarkColor: AppColors.saffronDark,
+                        onSelected: (_) =>
+                            setState(() => _selectedLocationId = loc.id),
+                      ),
+                    );
+                  }),
+                ],
               ),
-              loading: () => const SizedBox(
-                height: 32,
-                child: Center(child: LinearProgressIndicator()),
-              ),
-              error: (e, _) => Text('Error loading locations: $e'),
             ),
             const SizedBox(height: 4),
           ],
@@ -167,8 +158,7 @@ class _ManageMembersScreenState extends ConsumerState<ManageMembersScreen> {
                 }
 
                 final locationNames = <String, String>{
-                  for (final loc in locationsAsync.value ?? [])
-                    loc.id: loc.name,
+                  for (final loc in accessible) loc.id: loc.name,
                 };
 
                 return ListView.builder(
@@ -176,8 +166,9 @@ class _ManageMembersScreenState extends ConsumerState<ManageMembersScreen> {
                   itemCount: members.length,
                   itemBuilder: (context, index) {
                     final member = members[index];
-                    final locationLabel =
-                        showAll ? locationNames[member.locationId] : null;
+                    final locationLabel = showLocationLabels
+                        ? locationNames[member.locationId]
+                        : null;
                     return Card(
                       margin: const EdgeInsets.symmetric(vertical: 4),
                       child: ListTile(

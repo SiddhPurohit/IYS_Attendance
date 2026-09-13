@@ -9,18 +9,39 @@ import '../../sessions/providers/sessions_provider.dart';
 
 final _client = Supabase.instance.client;
 
-/// Fetches the active members eligible for a given session date — i.e. those
-/// whose joining date is on or before that date — sorted by name.
+/// Joins location ids into a stable family key.
+///
+/// Riverpod compares family arguments by value, and two equal `List`s are
+/// never `==` — so passing a List straight through would miss the cache on
+/// every rebuild and refetch endlessly. Sorting makes the key order-
+/// independent, so selecting Borivali then Malad hits the same cache entry
+/// as Malad then Borivali.
+String locationKey(Iterable<String> locationIds) {
+  final ids = locationIds.where((id) => id.isNotEmpty).toSet().toList()..sort();
+  return ids.join(',');
+}
+
+List<String> _splitKey(String key) =>
+    key.split(',').where((s) => s.isNotEmpty).toList();
+
+/// Fetches the active members eligible for a given session date across one
+/// or more locations — i.e. those whose joining date is on or before that
+/// date — sorted by name.
 ///
 /// Members who joined later are excluded so that a session predating them is
 /// never marked against them, which would otherwise skew their percentage.
+///
+/// [params.locationIds] must come from [locationKey].
 final activeMembersProvider =
-    FutureProvider.family<List<Member>, ({String locationId, String date})>(
+    FutureProvider.family<List<Member>, ({String locationIds, String date})>(
         (ref, params) async {
+  final ids = _splitKey(params.locationIds);
+  if (ids.isEmpty) return const [];
+
   final response = await _client
       .from('members')
       .select()
-      .eq('location_id', params.locationId)
+      .inFilter('location_id', ids)
       .eq('is_active', true)
       .lte('joined_on', params.date)
       .order('full_name');
@@ -28,22 +49,40 @@ final activeMembersProvider =
   return (response as List).map((e) => Member.fromJson(e)).toList();
 });
 
-/// Looks up an existing session for the given location + date, if any.
-/// Does NOT create one — creation only happens when attendance is saved,
-/// so simply browsing a date never pollutes the sessions table.
-final existingSessionProvider =
-    FutureProvider.family<Session?, ({String locationId, String date})>(
-        (ref, params) async {
-  final existing = await _client
-      .from('sessions')
-      .select()
-      .eq('location_id', params.locationId)
-      .eq('session_date', params.date)
-      .isFilter('event_id', null)
-      .maybeSingle();
+/// Attendance already marked for the regular sessions at these locations on
+/// this date, merged into one memberId → present map.
+///
+/// An empty map means nothing has been marked yet anywhere in the
+/// selection, which is what the UI uses to decide between "default everyone
+/// to present" and "load what was saved before".
+///
+/// [params.locationIds] must come from [locationKey].
+final existingAttendanceForDateProvider = FutureProvider.family<Map<String, bool>,
+    ({String locationIds, String date})>((ref, params) async {
+  final ids = _splitKey(params.locationIds);
+  if (ids.isEmpty) return const {};
 
-  if (existing == null) return null;
-  return Session.fromJson(existing);
+  final sessions = await _client
+      .from('sessions')
+      .select('id')
+      .inFilter('location_id', ids)
+      .eq('session_date', params.date)
+      // Regular sessions only — an event on the same day is marked separately.
+      .isFilter('event_id', null);
+
+  final sessionIds =
+      (sessions as List).map((s) => s['id'] as String).toList();
+  if (sessionIds.isEmpty) return const {};
+
+  final rows = await _client
+      .from('attendance')
+      .select('member_id, present')
+      .inFilter('session_id', sessionIds);
+
+  return {
+    for (final row in rows as List)
+      row['member_id'] as String: row['present'] as bool? ?? false,
+  };
 });
 
 /// Fetches existing attendance records for a session.
@@ -116,18 +155,39 @@ Future<void> saveAttendanceForSession({
   );
 }
 
-/// Saves attendance for the regular session on [date] at [locationId],
-/// creating that session on-demand if this is the first save for the day.
-Future<void> saveAttendance({
-  required String locationId,
+/// Saves a combined roster that may span several locations.
+///
+/// Each member's attendance is written to the session for *their own*
+/// location, creating those sessions on demand. So an admin marking
+/// Borivali and Malad together in one screen produces one session row per
+/// location — which is what keeps `attendance_summary_by_location`, the
+/// dashboard trend and the location bar chart exact.
+///
+/// Routing is driven by `member.locationId` rather than by the selected
+/// locations, so a member can never land on another location's session.
+/// A selected location with no eligible members gets no session at all,
+/// consistent with sessions only existing once something is marked.
+Future<void> saveAttendanceAcrossLocations({
   required String date,
+  required List<Member> members,
   required Map<String, bool> attendanceMap,
 }) async {
-  final session = await _getOrCreateSession(locationId: locationId, date: date);
-  await saveAttendanceForSession(
-    sessionId: session.id,
-    attendanceMap: attendanceMap,
-  );
+  final byLocation = <String, List<Member>>{};
+  for (final member in members) {
+    (byLocation[member.locationId] ??= []).add(member);
+  }
+
+  for (final entry in byLocation.entries) {
+    final session =
+        await _getOrCreateSession(locationId: entry.key, date: date);
+    await saveAttendanceForSession(
+      sessionId: session.id,
+      attendanceMap: {
+        for (final member in entry.value)
+          member.id: attendanceMap[member.id] ?? false,
+      },
+    );
+  }
 }
 
 /// Drops every cached list that is derived from attendance rows.
@@ -137,8 +197,9 @@ Future<void> saveAttendance({
 /// the super admin dashboard — until the app is restarted.
 void invalidateAttendanceCaches(WidgetRef ref) {
   // Attendance marking itself
-  ref.invalidate(existingSessionProvider);
   ref.invalidate(existingAttendanceProvider);
+  ref.invalidate(existingAttendanceForDateProvider);
+  ref.invalidate(activeMembersProvider);
   // Sessions list + detail
   ref.invalidate(sessionsListProvider);
   ref.invalidate(sessionDetailProvider);

@@ -3,14 +3,44 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 
 import '../../../core/models/location.dart';
 import '../../../core/models/member.dart';
+import '../../../core/providers/auth_provider.dart';
 
 final _client = Supabase.instance.client;
 
 /// Fetches all 4 locations.
+///
+/// Every authenticated user can read every location (the `locations_read`
+/// policy is deliberately open), so this is NOT a permission check — use
+/// [accessibleLocationsProvider] for anything the user is allowed to act on.
 final allLocationsProvider = FutureProvider<List<Location>>((ref) async {
   final response =
       await _client.from('locations').select().order('name');
   return (response as List).map((e) => Location.fromJson(e)).toList();
+});
+
+/// The locations the signed-in user may actually mark attendance for and
+/// add devotees to: everything for a super admin, and whatever
+/// `admin_locations` grants for everyone else.
+///
+/// This is the single source of truth for location scope in the client —
+/// it replaced `profile.locationId` when admins gained the ability to hold
+/// more than one location.
+final accessibleLocationsProvider = FutureProvider<List<Location>>((ref) async {
+  final profile = await ref.watch(currentProfileProvider.future);
+  if (profile == null) return const [];
+
+  final all = await ref.watch(allLocationsProvider.future);
+  if (profile.isSuperAdmin) return all;
+
+  final rows = await _client
+      .from('admin_locations')
+      .select('location_id')
+      .eq('profile_id', profile.id);
+
+  final granted = {
+    for (final row in rows as List) row['location_id'] as String,
+  };
+  return all.where((l) => granted.contains(l.id)).toList();
 });
 
 /// Fetches a single location's name by id (for display in headers/subtitles).

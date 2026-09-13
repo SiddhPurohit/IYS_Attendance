@@ -21,10 +21,7 @@ class AdminHomeScreen extends ConsumerWidget {
             if (profile == null) {
               return const Center(child: Text('Profile not found.'));
             }
-            return _AdminHomeContent(
-              fullName: profile.fullName,
-              locationId: profile.locationId ?? '',
-            );
+            return _AdminHomeContent(fullName: profile.fullName);
           },
           loading: () => const Center(child: CircularProgressIndicator()),
           error: (err, _) => Center(
@@ -61,14 +58,20 @@ class AdminHomeScreen extends ConsumerWidget {
 
 class _AdminHomeContent extends ConsumerWidget {
   final String fullName;
-  final String locationId;
 
-  const _AdminHomeContent({required this.fullName, required this.locationId});
+  const _AdminHomeContent({required this.fullName});
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final locationAsync = ref.watch(locationNameProvider(locationId));
-    final locationName = locationAsync.value ?? '...';
+    final locationAsync = ref.watch(accessibleLocationsProvider);
+    // An admin may hold several locations, so list them all rather than
+    // implying there is a single home location.
+    final locations = locationAsync.value;
+    final locationName = locations == null
+        ? '...'
+        : locations.isEmpty
+            ? 'No location assigned'
+            : locations.map((l) => l.name).join(' • ');
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,

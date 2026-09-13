@@ -99,7 +99,17 @@ class _AddEditMemberScreenState extends ConsumerState<AddEditMemberScreen> {
     final profileAsync = ref.watch(currentProfileProvider);
     final profile = profileAsync.asData?.value;
     final isSuperAdmin = profile?.isSuperAdmin ?? false;
-    final locationsAsync = ref.watch(allLocationsProvider);
+    final accessibleAsync = ref.watch(accessibleLocationsProvider);
+    final accessible = accessibleAsync.value ?? const [];
+
+    // The location is only a choice when this admin holds more than one.
+    // With exactly one there is nothing to ask, so it's assigned silently.
+    if (!widget.isEditing &&
+        _selectedLocationId == null &&
+        accessible.length == 1) {
+      _selectedLocationId = accessible.first.id;
+    }
+    final showLocationPicker = !widget.isEditing && accessible.length > 1;
 
     return Scaffold(
       appBar: AppBar(
@@ -140,13 +150,13 @@ class _AddEditMemberScreenState extends ConsumerState<AddEditMemberScreen> {
                 ),
                 const SizedBox(height: 24),
 
-                if (!widget.isEditing && isSuperAdmin) ...[
+                if (showLocationPicker) ...[
                   Text(
                     'Location *',
                     style: Theme.of(context).textTheme.labelLarge,
                   ),
                   const SizedBox(height: 8),
-                  locationsAsync.when(
+                  accessibleAsync.when(
                     data: (locations) => DropdownButtonFormField<String>(
                       initialValue: _selectedLocationId,
                       decoration: const InputDecoration(
@@ -358,14 +368,13 @@ class _AddEditMemberScreenState extends ConsumerState<AddEditMemberScreen> {
     setState(() => _saving = true);
 
     try {
-      final profile = await ref.read(currentProfileProvider.future);
       // When editing, the location dropdown is hidden — use the member's
-      // actual location, not the (empty) dropdown selection.
+      // actual location, not the (empty) dropdown selection. When adding,
+      // _selectedLocationId is either what the admin picked or the single
+      // location auto-assigned in _buildForm.
       final locationId = widget.isEditing
           ? (_memberLocationId ?? '')
-          : ((profile?.isSuperAdmin ?? false)
-              ? (_selectedLocationId ?? '')
-              : (profile?.locationId ?? ''));
+          : (_selectedLocationId ?? '');
 
       if (widget.isEditing) {
         await updateMember(
@@ -423,7 +432,7 @@ class _AddEditMemberScreenState extends ConsumerState<AddEditMemberScreen> {
         ),
       );
 
-      _leave(profile?.isSuperAdmin == true);
+      _leave(ref.read(currentProfileProvider).value?.isSuperAdmin ?? false);
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(

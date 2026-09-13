@@ -3,8 +3,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:intl/intl.dart';
 
+import '../../../core/models/location.dart';
 import '../../../core/models/member.dart';
-import '../../../core/models/session.dart';
 import '../../../core/providers/auth_provider.dart';
 import '../../../core/theme/app_theme.dart';
 import '../../../core/widgets/motifs.dart';
@@ -44,6 +44,10 @@ class _MarkAttendanceScreenState extends ConsumerState<MarkAttendanceScreen> {
   bool _saving = false;
   bool _initialized = false;
 
+  /// Locations currently being marked. Null until seeded from the admin's
+  /// accessible locations on first build; never empty afterwards.
+  Set<String>? _selectedLocationIds;
+
   /// memberId → present (true = present, false = absent)
   final Map<String, bool> _attendanceMap = {};
 
@@ -63,9 +67,19 @@ class _MarkAttendanceScreenState extends ConsumerState<MarkAttendanceScreen> {
         body: Center(child: body),
       );
 
+  /// The roster this screen is showing changed — different date, or a
+  /// different set of locations — so anything already toggled no longer
+  /// applies and has to be re-seeded from the database.
+  void _resetRoster() {
+    _initialized = false;
+    _attendanceMap.clear();
+  }
+
   @override
   Widget build(BuildContext context) {
     // Marking one specific session (an event, or editing a past session).
+    // The session pins both the location and the date, so nothing is
+    // selectable in this mode.
     if (widget.sessionId != null) {
       final sessionAsync = ref.watch(sessionDetailProvider(widget.sessionId!));
       final isSuperAdmin =
@@ -78,8 +92,8 @@ class _MarkAttendanceScreenState extends ConsumerState<MarkAttendanceScreen> {
           }
           return _buildContent(
             context,
-            session['location_id'] as String,
-            session['session_date'] as String,
+            locationIds: [session['location_id'] as String],
+            dateString: session['session_date'] as String,
             isSuperAdmin: isSuperAdmin,
             knownSessionId: widget.sessionId,
             eventTitle: session['event_title'] as String?,
@@ -90,46 +104,71 @@ class _MarkAttendanceScreenState extends ConsumerState<MarkAttendanceScreen> {
       );
     }
 
-    if (widget.locationId != null) {
-      // Location explicitly given (super admin flow) — no profile lookup needed.
-      return _buildContent(context, widget.locationId!, _dateString,
-          isSuperAdmin: true);
-    }
+    final accessibleAsync = ref.watch(accessibleLocationsProvider);
+    final isSuperAdmin =
+        ref.watch(currentProfileProvider).value?.isSuperAdmin ?? false;
 
-    final profileAsync = ref.watch(currentProfileProvider);
-
-    return profileAsync.when(
-      data: (profile) {
-        if (profile == null) {
-          return _shell(const Text('Profile not found.'));
+    return accessibleAsync.when(
+      data: (locations) {
+        if (locations.isEmpty) {
+          return _shell(
+            const Padding(
+              padding: EdgeInsets.all(24),
+              child: Text(
+                'No locations are assigned to your account.\n'
+                'Ask a super admin to give you access.',
+                textAlign: TextAlign.center,
+              ),
+            ),
+          );
         }
+
+        // Seeded once: the location the caller asked for (the super admin's
+        // picker dialog), otherwise everything this admin can reach.
+        final selected = _selectedLocationIds ??= {
+          if (widget.locationId != null &&
+              locations.any((l) => l.id == widget.locationId))
+            widget.locationId!
+          else
+            ...locations.map((l) => l.id),
+        };
+
         return _buildContent(
           context,
-          profile.locationId ?? '',
-          _dateString,
-          isSuperAdmin: profile.isSuperAdmin,
+          locationIds: selected.toList(),
+          dateString: _dateString,
+          isSuperAdmin: isSuperAdmin,
+          pickerOptions: locations,
         );
       },
       loading: () => _shell(const CircularProgressIndicator()),
-      error: (_, __) => _shell(const Text('Error loading profile.')),
+      error: (e, _) => _shell(Text('Could not load your locations.\n$e')),
     );
   }
 
   Widget _buildContent(
-    BuildContext context,
-    String locationId,
-    String dateString, {
+    BuildContext context, {
+    required List<String> locationIds,
+    required String dateString,
     required bool isSuperAdmin,
+    List<Location> pickerOptions = const [],
     String? knownSessionId,
     String? eventTitle,
   }) {
-    final sessionParams = (locationId: locationId, date: dateString);
-    final membersAsync = ref.watch(activeMembersProvider(sessionParams));
-    // When the session is already known there is nothing to look up, and a
-    // (location, date) lookup would find the regular session, not this one.
-    final existingSessionAsync = knownSessionId != null
-        ? AsyncValue<Session?>.data(null)
-        : ref.watch(existingSessionProvider(sessionParams));
+    final key = locationKey(locationIds);
+    final membersAsync =
+        ref.watch(activeMembersProvider((locationIds: key, date: dateString)));
+
+    // A known session is read directly; otherwise merge whatever has already
+    // been marked across the selected locations on this date.
+    final existingAsync = knownSessionId != null
+        ? ref.watch(existingAttendanceProvider(knownSessionId))
+        : ref.watch(existingAttendanceForDateProvider(
+            (locationIds: key, date: dateString),
+          ));
+
+    final showPicker = knownSessionId == null && pickerOptions.length > 1;
+    final locationNames = {for (final l in pickerOptions) l.id: l.name};
 
     return Scaffold(
       appBar: AppBar(
@@ -138,10 +177,12 @@ class _MarkAttendanceScreenState extends ConsumerState<MarkAttendanceScreen> {
           onPressed: () => _goBack(isSuperAdmin),
         ),
         title: Text(eventTitle ?? 'Mark Attendance'),
-        bottom: isSuperAdmin
+        // With a picker on screen the location is already obvious; this
+        // subtitle only earns its place when the location is fixed.
+        bottom: (knownSessionId != null && isSuperAdmin)
             ? PreferredSize(
                 preferredSize: const Size.fromHeight(30),
-                child: _LocationSubtitle(locationId: locationId),
+                child: _LocationSubtitle(locationId: locationIds.first),
               )
             : null,
       ),
@@ -160,8 +201,26 @@ class _MarkAttendanceScreenState extends ConsumerState<MarkAttendanceScreen> {
               onDateChanged: (date) {
                 setState(() {
                   _selectedDate = date;
-                  _initialized = false;
-                  _attendanceMap.clear();
+                  _resetRoster();
+                });
+              },
+            ),
+
+          if (showPicker)
+            _LocationPickerBar(
+              locations: pickerOptions,
+              selected: _selectedLocationIds ?? const {},
+              onToggle: (id) {
+                setState(() {
+                  final set = _selectedLocationIds ??= {};
+                  if (set.contains(id)) {
+                    // Never allow an empty selection — there would be
+                    // nothing left to mark.
+                    if (set.length > 1) set.remove(id);
+                  } else {
+                    set.add(id);
+                  }
+                  _resetRoster();
                 });
               },
             ),
@@ -189,34 +248,31 @@ class _MarkAttendanceScreenState extends ConsumerState<MarkAttendanceScreen> {
           // Members list
           Expanded(
             child: membersAsync.when(
-              data: (members) {
-                return existingSessionAsync.when(
-                  data: (session) {
-                    return _buildAttendanceList(
-                      context,
-                      members,
-                      knownSessionId ?? session?.id,
-                    );
-                  },
-                  loading: () =>
-                      const Center(child: CircularProgressIndicator()),
-                  error: (e, _) => Center(
-                    child: Padding(
-                      padding: const EdgeInsets.all(24),
-                      child: Text(
-                        'Could not load session.\n$e',
-                        textAlign: TextAlign.center,
-                      ),
+              data: (members) => existingAsync.when(
+                data: (existing) => _buildAttendanceList(
+                  context,
+                  members,
+                  existing,
+                  showLocationBadges: locationIds.length > 1,
+                  locationNames: locationNames,
+                ),
+                loading: () => const Center(child: CircularProgressIndicator()),
+                error: (e, _) => Center(
+                  child: Padding(
+                    padding: const EdgeInsets.all(24),
+                    child: Text(
+                      'Could not load existing attendance.\n$e',
+                      textAlign: TextAlign.center,
                     ),
                   ),
-                );
-              },
+                ),
+              ),
               loading: () => const Center(child: CircularProgressIndicator()),
               error: (e, _) => Center(
                 child: Padding(
                   padding: const EdgeInsets.all(24),
                   child: Text(
-                    'Could not load members.\n$e',
+                    'Could not load devotees.\n$e',
                     textAlign: TextAlign.center,
                   ),
                 ),
@@ -227,10 +283,9 @@ class _MarkAttendanceScreenState extends ConsumerState<MarkAttendanceScreen> {
           // Save button
           _buildSaveButton(
             context,
-            locationId,
-            dateString,
-            knownSessionId,
-            membersAsync.value != null,
+            members: membersAsync.value ?? const [],
+            dateString: dateString,
+            knownSessionId: knownSessionId,
           ),
         ],
       ),
@@ -240,53 +295,36 @@ class _MarkAttendanceScreenState extends ConsumerState<MarkAttendanceScreen> {
   Widget _buildAttendanceList(
     BuildContext context,
     List<Member> members,
-    String? sessionId,
-  ) {
-    // Load existing attendance if not initialized
+    Map<String, bool> existing, {
+    required bool showLocationBadges,
+    required Map<String, String> locationNames,
+  }) {
+    // Seed once per roster: whatever was marked before, everyone else
+    // present by default. Guarded on _initialized so re-builds never clobber
+    // toggles the admin has already made.
     if (!_initialized) {
-      if (sessionId == null) {
-        // No session exists for this date yet — default everyone to present.
-        for (final member in members) {
-          _attendanceMap[member.id] = true;
-        }
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (mounted) setState(() => _initialized = true);
-        });
-        return _membersList(context, members);
+      for (final member in members) {
+        _attendanceMap[member.id] = existing[member.id] ?? true;
       }
-
-      final existingAsync = ref.watch(existingAttendanceProvider(sessionId));
-      return existingAsync.when(
-        data: (existing) {
-          for (final member in members) {
-            if (existing.containsKey(member.id)) {
-              _attendanceMap[member.id] = existing[member.id]!;
-            } else {
-              _attendanceMap[member.id] = true; // Default: Present
-            }
-          }
-          WidgetsBinding.instance.addPostFrameCallback((_) {
-            if (mounted) setState(() => _initialized = true);
-          });
-          return _membersList(context, members);
-        },
-        loading: () => const Center(child: CircularProgressIndicator()),
-        error: (e, _) {
-          for (final member in members) {
-            _attendanceMap[member.id] = true;
-          }
-          WidgetsBinding.instance.addPostFrameCallback((_) {
-            if (mounted) setState(() => _initialized = true);
-          });
-          return _membersList(context, members);
-        },
-      );
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) setState(() => _initialized = true);
+      });
     }
 
-    return _membersList(context, members);
+    return _membersList(
+      context,
+      members,
+      showLocationBadges: showLocationBadges,
+      locationNames: locationNames,
+    );
   }
 
-  Widget _membersList(BuildContext context, List<Member> members) {
+  Widget _membersList(
+    BuildContext context,
+    List<Member> members, {
+    required bool showLocationBadges,
+    required Map<String, String> locationNames,
+  }) {
     final filtered = _searchQuery.isEmpty
         ? members
         : members
@@ -374,6 +412,11 @@ class _MarkAttendanceScreenState extends ConsumerState<MarkAttendanceScreen> {
 
               return _AttendanceRow(
                 name: member.fullName,
+                // Only when several locations are mixed into one list does
+                // the devotee's own location need spelling out.
+                locationName: showLocationBadges
+                    ? locationNames[member.locationId]
+                    : null,
                 isPresent: isPresent,
                 onToggle: () {
                   setState(() {
@@ -389,12 +432,12 @@ class _MarkAttendanceScreenState extends ConsumerState<MarkAttendanceScreen> {
   }
 
   Widget _buildSaveButton(
-    BuildContext context,
-    String locationId,
-    String dateString,
-    String? knownSessionId,
-    bool membersLoaded,
-  ) {
+    BuildContext context, {
+    required List<Member> members,
+    required String dateString,
+    required String? knownSessionId,
+  }) {
+    final membersLoaded = members.isNotEmpty;
     return Container(
       padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
       decoration: BoxDecoration(
@@ -415,7 +458,7 @@ class _MarkAttendanceScreenState extends ConsumerState<MarkAttendanceScreen> {
           child: ElevatedButton.icon(
             onPressed: (_saving || !_initialized || !membersLoaded)
                 ? null
-                : () => _save(locationId, dateString, knownSessionId),
+                : () => _save(members, dateString, knownSessionId),
             icon: _saving
                 ? const SizedBox(
                     width: 22,
@@ -448,7 +491,7 @@ class _MarkAttendanceScreenState extends ConsumerState<MarkAttendanceScreen> {
   }
 
   Future<void> _save(
-    String locationId,
+    List<Member> members,
     String dateString,
     String? knownSessionId,
   ) async {
@@ -461,9 +504,10 @@ class _MarkAttendanceScreenState extends ConsumerState<MarkAttendanceScreen> {
           attendanceMap: _attendanceMap,
         );
       } else {
-        await saveAttendance(
-          locationId: locationId,
+        // Fans out to one session per location represented in the roster.
+        await saveAttendanceAcrossLocations(
           date: dateString,
+          members: members,
           attendanceMap: _attendanceMap,
         );
       }
@@ -527,6 +571,60 @@ class _LocationSubtitle extends ConsumerWidget {
         style: Theme.of(context).textTheme.bodyMedium?.copyWith(
               color: AppColors.onSurfaceVariant,
             ),
+      ),
+    );
+  }
+}
+
+/// Location chips for an admin who holds more than one location. Selecting
+/// several merges their devotees into a single list to mark in one pass;
+/// on save each devotee still lands on their own location's session.
+class _LocationPickerBar extends StatelessWidget {
+  final List<Location> locations;
+  final Set<String> selected;
+  final ValueChanged<String> onToggle;
+
+  const _LocationPickerBar({
+    required this.locations,
+    required this.selected,
+    required this.onToggle,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.fromLTRB(16, 10, 16, 6),
+      color: Colors.white,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            'MARKING FOR',
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                  color: AppColors.onSurfaceVariant,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 0.6,
+                  fontSize: 11,
+                ),
+          ),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: locations.map((loc) {
+              final isSelected = selected.contains(loc.id);
+              return FilterChip(
+                selected: isSelected,
+                label: Text(loc.name),
+                onSelected: (_) => onToggle(loc.id),
+                selectedColor: AppColors.saffron.withValues(alpha: 0.2),
+                checkmarkColor: AppColors.saffronDark,
+                visualDensity: VisualDensity.compact,
+              );
+            }).toList(),
+          ),
+        ],
       ),
     );
   }
@@ -669,10 +767,15 @@ class _AttendanceRow extends StatelessWidget {
   final bool isPresent;
   final VoidCallback onToggle;
 
+  /// Set only when the list mixes several locations, so it's clear which
+  /// devotee belongs where.
+  final String? locationName;
+
   const _AttendanceRow({
     required this.name,
     required this.isPresent,
     required this.onToggle,
+    this.locationName,
   });
 
   @override
@@ -707,17 +810,34 @@ class _AttendanceRow extends StatelessWidget {
 
               // Name
               Expanded(
-                child: Text(
-                  name,
-                  style: Theme.of(context).textTheme.bodyLarge?.copyWith(
-                        fontWeight: FontWeight.w500,
-                        decoration: isPresent
-                            ? null
-                            : TextDecoration.lineThrough,
-                        color: isPresent
-                            ? AppColors.onSurface
-                            : AppColors.onSurfaceVariant,
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      name,
+                      style: Theme.of(context).textTheme.bodyLarge?.copyWith(
+                            fontWeight: FontWeight.w500,
+                            decoration: isPresent
+                                ? null
+                                : TextDecoration.lineThrough,
+                            color: isPresent
+                                ? AppColors.onSurface
+                                : AppColors.onSurfaceVariant,
+                          ),
+                    ),
+                    if (locationName != null) ...[
+                      const SizedBox(height: 3),
+                      Text(
+                        locationName!,
+                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                              color: AppColors.saffronDark,
+                              fontWeight: FontWeight.w600,
+                              fontSize: 11.5,
+                            ),
                       ),
+                    ],
+                  ],
                 ),
               ),
 

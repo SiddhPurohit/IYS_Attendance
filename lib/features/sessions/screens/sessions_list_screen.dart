@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:intl/intl.dart';
 
+import '../../../core/models/location.dart';
 import '../../../core/providers/auth_provider.dart';
 import '../../../core/theme/app_theme.dart';
 import '../../../core/widgets/motifs.dart';
@@ -32,23 +33,15 @@ class _SessionsListScreenState extends ConsumerState<SessionsListScreen> {
             body: const Center(child: Text('Profile not found.')),
           );
         }
-        final isSuperAdmin = profile.isSuperAdmin;
-        // null means "every location" to the provider, so only a super admin
-        // may pass it. A location admin without a location sees nothing
-        // rather than everything.
-        if (!isSuperAdmin &&
-            (profile.locationId == null || profile.locationId!.isEmpty)) {
-          return Scaffold(
-            appBar: AppBar(title: const Text('Sessions')),
-            body: const Center(
-              child: Text('No location assigned to your account.'),
-            ),
-          );
-        }
-        final filterLocationId =
-            isSuperAdmin ? _selectedLocationId : profile.locationId;
-
-        return _buildScaffold(context, isSuperAdmin, filterLocationId);
+        // A null filter means "everything I'm allowed to see". RLS already
+        // narrows that to this admin's locations, so no client-side location
+        // guard is needed — a super admin gets all of them, an admin gets
+        // whichever they've been granted.
+        return _buildScaffold(
+          context,
+          profile.isSuperAdmin,
+          _selectedLocationId,
+        );
       },
       loading: () => Scaffold(
         appBar: AppBar(title: const Text('Sessions')),
@@ -67,6 +60,10 @@ class _SessionsListScreenState extends ConsumerState<SessionsListScreen> {
     String? filterLocationId,
   ) {
     final sessionsAsync = ref.watch(sessionsListProvider(filterLocationId));
+    final accessible = ref.watch(accessibleLocationsProvider).value ?? const [];
+    // Only worth a filter row when there is actually something to filter
+    // between.
+    final showLocationFilter = accessible.length > 1;
 
     return Scaffold(
       appBar: AppBar(
@@ -84,9 +81,9 @@ class _SessionsListScreenState extends ConsumerState<SessionsListScreen> {
       ),
       body: Column(
         children: [
-          if (isSuperAdmin) ...[
+          if (showLocationFilter) ...[
             const SizedBox(height: 12),
-            _buildLocationFilter(),
+            _buildLocationFilter(accessible),
             const SizedBox(height: 4),
           ],
           Expanded(
@@ -260,44 +257,36 @@ class _SessionsListScreenState extends ConsumerState<SessionsListScreen> {
     );
   }
 
-  Widget _buildLocationFilter() {
-    final locationsAsync = ref.watch(allLocationsProvider);
-    return locationsAsync.when(
-      data: (locations) => SingleChildScrollView(
-        scrollDirection: Axis.horizontal,
-        padding: const EdgeInsets.symmetric(horizontal: 16),
-        child: Row(
-          children: [
-            FilterChip(
-              selected: _selectedLocationId == null,
-              label: const Text('All Locations'),
-              selectedColor: AppColors.saffron.withValues(alpha: 0.2),
-              checkmarkColor: AppColors.saffronDark,
-              onSelected: (_) => setState(() => _selectedLocationId = null),
-            ),
-            const SizedBox(width: 8),
-            ...locations.map((loc) {
-              final isSelected = _selectedLocationId == loc.id;
-              return Padding(
-                padding: const EdgeInsets.only(right: 8),
-                child: FilterChip(
-                  selected: isSelected,
-                  label: Text(loc.name),
-                  selectedColor: AppColors.saffron.withValues(alpha: 0.2),
-                  checkmarkColor: AppColors.saffronDark,
-                  onSelected: (_) =>
-                      setState(() => _selectedLocationId = loc.id),
-                ),
-              );
-            }),
-          ],
-        ),
+  Widget _buildLocationFilter(List<Location> locations) {
+    return SingleChildScrollView(
+      scrollDirection: Axis.horizontal,
+      padding: const EdgeInsets.symmetric(horizontal: 16),
+      child: Row(
+        children: [
+          FilterChip(
+            selected: _selectedLocationId == null,
+            label: const Text('All Locations'),
+            selectedColor: AppColors.saffron.withValues(alpha: 0.2),
+            checkmarkColor: AppColors.saffronDark,
+            onSelected: (_) => setState(() => _selectedLocationId = null),
+          ),
+          const SizedBox(width: 8),
+          ...locations.map((loc) {
+            final isSelected = _selectedLocationId == loc.id;
+            return Padding(
+              padding: const EdgeInsets.only(right: 8),
+              child: FilterChip(
+                selected: isSelected,
+                label: Text(loc.name),
+                selectedColor: AppColors.saffron.withValues(alpha: 0.2),
+                checkmarkColor: AppColors.saffronDark,
+                onSelected: (_) =>
+                    setState(() => _selectedLocationId = loc.id),
+              ),
+            );
+          }),
+        ],
       ),
-      loading: () => const SizedBox(
-        height: 40,
-        child: Center(child: LinearProgressIndicator()),
-      ),
-      error: (e, _) => Text('Error loading locations: $e'),
     );
   }
 }
